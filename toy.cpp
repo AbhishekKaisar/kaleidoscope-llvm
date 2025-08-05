@@ -138,6 +138,9 @@ std::unique_ptr<ExprAST> LogError(const char *Str) {
   return nullptr;
 }
 
+// Forward declaration for ParseExpression, used in ParseParenExpr and elsewhere.
+std::unique_ptr<ExprAST> ParseExpression();
+
 std::unique_ptr<ExprAST> ParseNumberExpr() {
   auto Result = std::make_unique<NumberExprAST>(NumVal);
   getNextToken(); // consume the number

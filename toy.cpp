@@ -16,6 +16,7 @@ enum Token {
   // commands
   tok_def = -2,
   tok_extern = -3,
+  tok_var = -6,
 
   // primary
   tok_identifier = -4,
@@ -179,6 +180,54 @@ public:
   }
 };
 
+// Expression class for variable declaration (var ... in ...)
+class VarExprAST : public ExprAST {
+  std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+  std::unique_ptr<ExprAST> Body;
+
+public:
+  VarExprAST(std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames,
+             std::unique_ptr<ExprAST> Body)
+      : VarNames(std::move(VarNames)), Body(std::move(Body)) {}
+
+  llvm::Value *codegen() override;
+};
+
+// Implementation of VarExprAST::codegen
+llvm::Value *VarExprAST::codegen() {
+  std::vector<llvm::Value *> OldBindings;
+
+  llvm::Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+  for (auto &Var : VarNames) {
+    const std::string &VarName = Var.first;
+    llvm::Value *InitVal;
+    if (Var.second) {
+      InitVal = Var.second->codegen();
+      if (!InitVal)
+        return nullptr;
+    } else {
+      InitVal = llvm::ConstantFP::get(*TheContext, llvm::APFloat(0.0));
+    }
+
+    llvm::AllocaInst *Alloca = Builder->CreateAlloca(llvm::Type::getDoubleTy(*TheContext), nullptr, VarName);
+    Builder->CreateStore(InitVal, Alloca);
+
+    OldBindings.push_back(NamedValues[VarName]);
+    NamedValues[VarName] = Alloca;
+  }
+
+  llvm::Value *BodyVal = Body->codegen();
+  if (!BodyVal)
+    return nullptr;
+
+  int i = 0;
+  for (auto &Var : VarNames)
+    NamedValues[Var.first] = OldBindings[i++];
+
+  return BodyVal;
+}
+
 // This class represents a function definition.
 class FunctionAST {
   std::unique_ptr<PrototypeAST> Proto;
@@ -228,6 +277,7 @@ int gettok() {
 
     if (IdentifierStr == "def") return tok_def;
     if (IdentifierStr == "extern") return tok_extern;
+    if (IdentifierStr == "var") return tok_var;
     return tok_identifier;
   }
 
@@ -319,11 +369,54 @@ std::unique_ptr<ExprAST> ParseIdentifierExpr() {
   return std::make_unique<CallExprAST>(IdName, std::move(Args));
 }
 
+std::unique_ptr<ExprAST> ParseVarExpr() {
+  getNextToken(); // eat 'var'
+
+  std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+
+  if (CurTok != tok_identifier)
+    return LogError<std::unique_ptr<ExprAST>>("expected identifier after var");
+
+  while (true) {
+    std::string Name = IdentifierStr;
+    getNextToken(); // eat identifier
+
+    std::unique_ptr<ExprAST> Init = nullptr;
+    if (CurTok == '=') {
+      getNextToken(); // eat '='
+      Init = ParseExpression();
+      if (!Init)
+        return nullptr;
+    }
+
+    VarNames.push_back(std::make_pair(Name, std::move(Init)));
+
+    if (CurTok != ',')
+      break;
+    getNextToken(); // eat ','
+
+    if (CurTok != tok_identifier)
+      return LogError<std::unique_ptr<ExprAST>>("expected identifier after ','");
+  }
+
+  if (IdentifierStr != "in")
+    return LogError<std::unique_ptr<ExprAST>>("expected 'in' after variable declaration");
+
+  getNextToken(); // eat 'in'
+
+  auto Body = ParseExpression();
+  if (!Body)
+    return nullptr;
+
+  return std::make_unique<VarExprAST>(std::move(VarNames), std::move(Body));
+}
+
 std::unique_ptr<ExprAST> ParsePrimary() {
   switch (CurTok) {
     case tok_identifier: return ParseIdentifierExpr();
     case tok_number:     return ParseNumberExpr();
     case '(':            return ParseParenExpr();
+    case tok_var:        return ParseVarExpr();
     default:             return LogError<std::unique_ptr<ExprAST>>("unknown token when expecting an expression");
   }
 }
@@ -409,7 +502,7 @@ llvm::Value *VariableExprAST::codegen() {
   llvm::Value *V = NamedValues[Name];
   if (!V)
     return LogError<llvm::Value*>("Unknown variable name");
-  return V;
+  return Builder->CreateLoad(llvm::Type::getDoubleTy(*TheContext), V, Name.c_str());
 }
 
 void HandleTopLevelExpression() {

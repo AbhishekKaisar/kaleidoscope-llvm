@@ -27,16 +27,58 @@ static double NumVal;
 
 static std::map<std::string, llvm::Value *> NamedValues;
 
+static std::map<char, int> BinopPrecedence;
+
 
 static std::unique_ptr<llvm::LLVMContext> TheContext;
 static std::unique_ptr<llvm::IRBuilder<>> Builder;
 static std::unique_ptr<llvm::Module> TheModule;
 
 
+// This class represents the "prototype" for a function.
+class PrototypeAST {
+  std::string Name;
+  std::vector<std::string> Args;
+
+public:
+  PrototypeAST(const std::string &Name, std::vector<std::string> Args)
+      : Name(Name), Args(std::move(Args)) {}
+
+  const std::string &getName() const { return Name; }
+
+  llvm::Function *codegen() {
+    std::vector<llvm::Type *> Doubles(Args.size(), llvm::Type::getDoubleTy(*TheContext));
+    llvm::FunctionType *FT =
+        llvm::FunctionType::get(llvm::Type::getDoubleTy(*TheContext), Doubles, false);
+    llvm::Function *F =
+        llvm::Function::Create(FT, llvm::Function::ExternalLinkage, Name, TheModule.get());
+
+    unsigned Idx = 0;
+    for (auto &Arg : F->args())
+      Arg.setName(Args[Idx++]);
+
+    return F;
+  }
+};
 
 // Function template for error logging, with specializations.
+
 template<typename T>
 T LogError(const char *Str);
+
+// Specialization for std::unique_ptr<PrototypeAST>
+template<>
+std::unique_ptr<PrototypeAST> LogError<std::unique_ptr<PrototypeAST>>(const char *Str) {
+  std::cerr << "Error: " << Str << "\n";
+  return nullptr;
+}
+
+// Base class for all expression nodes.
+class ExprAST {
+public:
+  virtual ~ExprAST() = default;
+  virtual llvm::Value *codegen() = 0;
+};
 
 // Dummy derived class to allow returning a unique_ptr<ExprAST>
 class DummyExprAST : public ExprAST {
@@ -57,13 +99,6 @@ std::unique_ptr<ExprAST> LogError<std::unique_ptr<ExprAST>>(const char *Str) {
   std::cerr << "Error: " << Str << "\n";
   return std::make_unique<DummyExprAST>();
 }
-
-// Base class for all expression nodes.
-class ExprAST {
-public:
-  virtual ~ExprAST() = default;
-  virtual llvm::Value *codegen() = 0;
-};
 
 // Expression class for numeric literals like "1.0".
 class NumberExprAST : public ExprAST {
@@ -144,18 +179,6 @@ public:
   }
 };
 
-// This class represents the "prototype" for a function.
-class PrototypeAST {
-  std::string Name;
-  std::vector<std::string> Args;
-
-public:
-  PrototypeAST(const std::string &Name, std::vector<std::string> Args)
-      : Name(Name), Args(std::move(Args)) {}
-
-  const std::string &getName() const { return Name; }
-};
-
 // This class represents a function definition.
 class FunctionAST {
   std::unique_ptr<PrototypeAST> Proto;
@@ -165,6 +188,30 @@ public:
   FunctionAST(std::unique_ptr<PrototypeAST> Proto,
               std::unique_ptr<ExprAST> Body)
       : Proto(std::move(Proto)), Body(std::move(Body)) {}
+
+  llvm::Function *codegen() {
+    llvm::Function *TheFunction = TheModule->getFunction(Proto->getName());
+    if (!TheFunction)
+      TheFunction = Proto->codegen();
+    if (!TheFunction)
+      return nullptr;
+
+    llvm::BasicBlock *BB = llvm::BasicBlock::Create(*TheContext, "entry", TheFunction);
+    Builder->SetInsertPoint(BB);
+
+    NamedValues.clear();
+    for (auto &Arg : TheFunction->args())
+      NamedValues[std::string(Arg.getName())] = &Arg;
+
+    if (llvm::Value *RetVal = Body->codegen()) {
+      Builder->CreateRet(RetVal);
+      llvm::verifyFunction(*TheFunction);
+      return TheFunction;
+    }
+
+    TheFunction->eraseFromParent();
+    return nullptr;
+  }
 };
 
 int gettok() {
@@ -212,6 +259,15 @@ int gettok() {
 // === PARSER BASICS ===
 static int CurTok;
 int getNextToken() { return CurTok = gettok(); }
+
+int GetTokPrecedence() {
+  if (!isascii(CurTok))
+    return -1;
+
+  int TokPrec = BinopPrecedence[CurTok];
+  if (TokPrec <= 0) return -1;
+  return TokPrec;
+}
 
 
 // Forward declaration for ParseExpression, used in ParseParenExpr and elsewhere.
@@ -272,9 +328,78 @@ std::unique_ptr<ExprAST> ParsePrimary() {
   }
 }
 
-std::unique_ptr<ExprAST> ParseExpression() {
-  return ParsePrimary();
+std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec, std::unique_ptr<ExprAST> LHS) {
+  while (true) {
+    int TokPrec = GetTokPrecedence();
+
+    if (TokPrec < ExprPrec)
+      return LHS;
+
+    int BinOp = CurTok;
+    getNextToken(); // eat binary operator
+
+    auto RHS = ParsePrimary();
+    if (!RHS)
+      return nullptr;
+
+    int NextPrec = GetTokPrecedence();
+    if (TokPrec < NextPrec) {
+      RHS = ParseBinOpRHS(TokPrec + 1, std::move(RHS));
+      if (!RHS)
+        return nullptr;
+    }
+
+    LHS = std::make_unique<BinaryExprAST>(BinOp, std::move(LHS), std::move(RHS));
+  }
 }
+
+std::unique_ptr<ExprAST> ParseExpression() {
+  auto LHS = ParsePrimary();
+  if (!LHS)
+    return nullptr;
+
+  return ParseBinOpRHS(0, std::move(LHS));
+}
+
+std::unique_ptr<PrototypeAST> ParsePrototype() {
+  if (CurTok != tok_identifier)
+    return LogError<std::unique_ptr<PrototypeAST>>("Expected function name in prototype");
+
+  std::string FnName = IdentifierStr;
+  getNextToken(); // eat function name
+
+  if (CurTok != '(')
+    return LogError<std::unique_ptr<PrototypeAST>>("Expected '(' in prototype");
+
+  std::vector<std::string> ArgNames;
+  while (getNextToken() == tok_identifier)
+    ArgNames.push_back(IdentifierStr);
+
+  if (CurTok != ')')
+    return LogError<std::unique_ptr<PrototypeAST>>("Expected ')' in prototype");
+
+  getNextToken(); // eat ')'
+  return std::make_unique<PrototypeAST>(FnName, std::move(ArgNames));
+}
+
+std::unique_ptr<FunctionAST> ParseDefinition() {
+  getNextToken(); // eat 'def'
+  auto Proto = ParsePrototype();
+  if (!Proto)
+    return nullptr;
+
+  if (auto E = ParseExpression())
+    return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
+  return nullptr;
+}
+
+std::unique_ptr<PrototypeAST> ParseExtern() {
+  getNextToken(); // eat 'extern'
+  return ParsePrototype();
+}
+
+std::unique_ptr<PrototypeAST> ParsePrototype();
+std::unique_ptr<FunctionAST> ParseDefinition();
 
 llvm::Value *NumberExprAST::codegen() {
   return llvm::ConstantFP::get(*TheContext, llvm::APFloat(Val));
@@ -287,25 +412,65 @@ llvm::Value *VariableExprAST::codegen() {
   return V;
 }
 
+void HandleTopLevelExpression() {
+  if (auto ExprAST = ParseExpression()) {
+    auto Proto = std::make_unique<PrototypeAST>("__anon_expr", std::vector<std::string>());
+    auto FnAST = std::make_unique<FunctionAST>(std::move(Proto), std::move(ExprAST));
+    if (auto *FnIR = FnAST->codegen()) {
+      std::cout << "Read top-level expression:\n";
+      FnIR->print(llvm::errs());
+      std::cerr << "\n";
+    }
+  } else {
+    getNextToken(); // skip token for error recovery
+  }
+}
+
 int main() {
   TheContext = std::make_unique<llvm::LLVMContext>();
   TheModule = std::make_unique<llvm::Module>("my cool jit", *TheContext);
   Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
 
-  std::cout << "Ready> ";
+  BinopPrecedence['<'] = 10;
+  BinopPrecedence['+'] = 20;
+  BinopPrecedence['-'] = 20;
+  BinopPrecedence['*'] = 40;
+
   getNextToken();
 
   while (true) {
     std::cout << "Ready> ";
-    if (CurTok == tok_eof) break;
-    if (CurTok == ';') {
-      getNextToken();
-      continue;
-    }
-    if (auto IR = ParseExpression()->codegen()) {
-      IR->print(llvm::errs());
-      std::cerr << "\n";
+    switch (CurTok) {
+      case tok_eof:
+        return 0;
+      case ';':
+        getNextToken();
+        break;
+      case tok_def:
+        if (auto FnAST = ParseDefinition()) {
+          if (auto *FnIR = FnAST->codegen()) {
+            std::cout << "Read function definition:\n";
+            FnIR->print(llvm::errs());
+            std::cerr << "\n";
+          }
+        } else {
+          getNextToken();
+        }
+        break;
+      case tok_extern:
+        if (auto ProtoAST = ParseExtern()) {
+          if (auto *IR = ProtoAST->codegen()) {
+            std::cout << "Read extern:\n";
+            IR->print(llvm::errs());
+            std::cerr << "\n";
+          }
+        } else {
+          getNextToken();
+        }
+        break;
+      default:
+        HandleTopLevelExpression();
+        break;
     }
   }
-  return 0;
 }
